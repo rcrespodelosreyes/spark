@@ -16,6 +16,7 @@
  */
 package org.apache.spark.deploy.k8s.submit
 
+import java.net.HttpURLConnection.HTTP_GONE
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 
 import scala.collection.JavaConverters._
@@ -28,8 +29,10 @@ import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.util.ThreadUtils
 
+
 private[k8s] trait LoggingPodStatusWatcher extends Watcher[Pod] {
   def awaitCompletion(): Unit
+  def watchOrStop(sId: String): Boolean
 }
 
 /**
@@ -41,10 +44,12 @@ private[k8s] trait LoggingPodStatusWatcher extends Watcher[Pod] {
  *                             number.
  */
 private[k8s] class LoggingPodStatusWatcherImpl(
-    appId: String,
-    maybeLoggingInterval: Option[Long])
+                                                appId: String,
+                                                maybeLoggingInterval: Option[Long])
   extends LoggingPodStatusWatcher with Logging {
 
+  private var resourceTooOldReceived: Boolean = false
+  private var podCompleted = false
   private val podCompletedFuture = new CountDownLatch(1)
   // start timer for periodic logging
   private val scheduler =
@@ -79,7 +84,12 @@ private[k8s] class LoggingPodStatusWatcherImpl(
 
   override def onClose(e: KubernetesClientException): Unit = {
     logDebug(s"Stopping watching application $appId with last-observed phase $phase")
-    closeWatch()
+    if (e != null && e.getCode==HTTP_GONE) {
+      resourceTooOldReceived = true
+      logDebug(s"Got HTTP Gone code, resource version changed in k8s api: $e")
+    } else {
+      closeWatch()
+    }
   }
 
   private def logShortStatus() = {
@@ -97,6 +107,7 @@ private[k8s] class LoggingPodStatusWatcherImpl(
   private def closeWatch(): Unit = {
     podCompletedFuture.countDown()
     scheduler.shutdown()
+    podCompleted = true
   }
 
   private def formatPodState(pod: Pod): String = {
@@ -151,7 +162,7 @@ private[k8s] class LoggingPodStatusWatcherImpl(
   }
 
   private def containerStatusDescription(
-      containerStatus: ContainerStatus): Seq[(String, String)] = {
+                                          containerStatus: ContainerStatus): Seq[(String, String)] = {
     val state = containerStatus.getState
     Option(state.getRunning)
       .orElse(Option(state.getTerminated))
@@ -171,10 +182,33 @@ private[k8s] class LoggingPodStatusWatcherImpl(
             ("Exit code", terminated.getExitCode.toString))
         case unknown =>
           throw new SparkException(s"Unexpected container status type ${unknown.getClass}.")
-        }.getOrElse(Seq(("Container state", "N/A")))
+      }.getOrElse(Seq(("Container state", "N/A")))
   }
 
   private def formatTime(time: String): String = {
     if (time != null ||  time != "") time else "N/A"
+  }
+
+  override def watchOrStop(sId: String): Boolean = if (hasCompleted()) {
+    logInfo(s"Waiting for application ${appId} with submission ID $sId to finish...")
+    val interval = maybeLoggingInterval
+    synchronized {
+      while (!podCompleted && !resourceTooOldReceived) {
+        wait(interval.get)
+        logInfo(s"Application status for $appId (phase: $phase)")
+      }
+    }
+
+    if(podCompleted) {
+      logInfo(
+        pod.map { p => s"Container final statuses:\n\n${containersDescription(p)}" }
+          .getOrElse("No containers were found in the driver pod."))
+      logInfo(s"Application ${appId} with submission ID $sId finished")
+    }
+    podCompleted
+  } else {
+    logInfo(s"Deployed Spark application ${appId} with submission ID $sId into Kubernetes")
+    // Always act like the application has completed since we don't want to wait for app completion
+    true
   }
 }

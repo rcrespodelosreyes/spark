@@ -17,13 +17,15 @@
 package org.apache.spark.deploy.k8s.submit
 
 import java.io.StringWriter
+import java.net.HttpURLConnection.HTTP_GONE
 import java.util.{Collections, UUID}
 import java.util.Properties
 
 import io.fabric8.kubernetes.api.model._
-import io.fabric8.kubernetes.client.KubernetesClient
+import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException, Watch}
 import scala.collection.mutable
 import scala.util.control.NonFatal
+import util.control.Breaks._
 
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.SparkApplication
@@ -42,10 +44,10 @@ import org.apache.spark.util.Utils
  * @param maybePyFiles additional Python files via --py-files
  */
 private[spark] case class ClientArguments(
-    mainAppResource: Option[MainAppResource],
-    mainClass: String,
-    driverArgs: Array[String],
-    maybePyFiles: Option[String])
+                                           mainAppResource: Option[MainAppResource],
+                                           mainClass: String,
+                                           driverArgs: Array[String],
+                                           maybePyFiles: Option[String])
 
 private[spark] object ClientArguments {
 
@@ -98,13 +100,13 @@ private[spark] object ClientArguments {
  * @param watcher a watcher that monitors and logs the application status
  */
 private[spark] class Client(
-    builder: KubernetesDriverBuilder,
-    kubernetesConf: KubernetesConf[KubernetesDriverSpecificConf],
-    kubernetesClient: KubernetesClient,
-    waitForAppCompletion: Boolean,
-    appName: String,
-    watcher: LoggingPodStatusWatcher,
-    kubernetesResourceNamePrefix: String) extends Logging {
+                             builder: KubernetesDriverBuilder,
+                             kubernetesConf: KubernetesConf[KubernetesDriverSpecificConf],
+                             kubernetesClient: KubernetesClient,
+                             waitForAppCompletion: Boolean,
+                             appName: String,
+                             watcher: LoggingPodStatusWatcher,
+                             kubernetesResourceNamePrefix: String) extends Logging {
 
   def run(): Unit = {
     val resolvedDriverSpec = builder.buildFromFeatures(kubernetesConf)
@@ -114,48 +116,52 @@ private[spark] class Client(
     // Spark command builder to pickup on the Java Options present in the ConfigMap
     val resolvedDriverContainer = new ContainerBuilder(resolvedDriverSpec.pod.container)
       .addNewEnv()
-        .withName(ENV_SPARK_CONF_DIR)
-        .withValue(SPARK_CONF_DIR_INTERNAL)
-        .endEnv()
+      .withName(ENV_SPARK_CONF_DIR)
+      .withValue(SPARK_CONF_DIR_INTERNAL)
+      .endEnv()
       .addNewVolumeMount()
-        .withName(SPARK_CONF_VOLUME)
-        .withMountPath(SPARK_CONF_DIR_INTERNAL)
-        .endVolumeMount()
+      .withName(SPARK_CONF_VOLUME)
+      .withMountPath(SPARK_CONF_DIR_INTERNAL)
+      .endVolumeMount()
       .build()
     val resolvedDriverPod = new PodBuilder(resolvedDriverSpec.pod.pod)
       .editSpec()
-        .addToContainers(resolvedDriverContainer)
-        .addNewVolume()
-          .withName(SPARK_CONF_VOLUME)
-          .withNewConfigMap()
-            .withName(configMapName)
-            .endConfigMap()
-          .endVolume()
-        .endSpec()
+      .addToContainers(resolvedDriverContainer)
+      .addNewVolume()
+      .withName(SPARK_CONF_VOLUME)
+      .withNewConfigMap()
+      .withName(configMapName)
+      .endConfigMap()
+      .endVolume()
+      .endSpec()
       .build()
-    Utils.tryWithResource(
-      kubernetesClient
-        .pods()
-        .withName(resolvedDriverPod.getMetadata.getName)
-        .watch(watcher)) { _ =>
-      val createdDriverPod = kubernetesClient.pods().create(resolvedDriverPod)
-      try {
-        val otherKubernetesResources =
-          resolvedDriverSpec.driverKubernetesResources ++ Seq(configMap)
-        addDriverOwnerReference(createdDriverPod, otherKubernetesResources)
-        kubernetesClient.resourceList(otherKubernetesResources: _*).createOrReplace()
-      } catch {
-        case NonFatal(e) =>
-          kubernetesClient.pods().delete(createdDriverPod)
-          throw e
-      }
 
-      if (waitForAppCompletion) {
-        logInfo(s"Waiting for application $appName to finish...")
-        watcher.awaitCompletion()
-        logInfo(s"Application $appName finished.")
-      } else {
-        logInfo(s"Deployed Spark application $appName into Kubernetes.")
+    val driverPodName = resolvedDriverPod.getMetadata.getName
+    var watch: Watch = null
+    val createdDriverPod = kubernetesClient.pods().create(resolvedDriverPod)
+    try {
+      val otherKubernetesResources = resolvedDriverSpec.driverKubernetesResources ++ Seq(configMap)
+      addDriverOwnerReference(createdDriverPod, otherKubernetesResources)
+      kubernetesClient.resourceList(otherKubernetesResources: _*).createOrReplace()
+    } catch {
+      case NonFatal(e) =>
+        kubernetesClient.pods().delete(createdDriverPod)
+        throw e
+    }
+    val sId = Seq(kubernetesConf.namespace(), driverPodName).mkString(":")
+    breakable {
+      while (true) {
+        try {
+          watch = kubernetesClient
+            .pods()
+            .withName(driverPodName)
+            .watch(watcher)
+          watcher.watchOrStop(sId)
+          break
+        } catch {
+          case e: KubernetesClientException if e.getCode == HTTP_GONE =>
+            logInfo("Resource version changed rerunning the watcher")
+        }
       }
     }
   }
@@ -187,8 +193,8 @@ private[spark] class Client(
       s"Java properties built from Kubernetes config map with name: $configMapName")
     new ConfigMapBuilder()
       .withNewMetadata()
-        .withName(configMapName)
-        .endMetadata()
+      .withName(configMapName)
+      .endMetadata()
       .addToData(SPARK_CONF_FILE_NAME, propertiesWriter.toString)
       .build()
   }
@@ -239,15 +245,15 @@ private[spark] class KubernetesClientApplication extends SparkApplication {
       sparkConf,
       None,
       None)) { kubernetesClient =>
-        val client = new Client(
-          builder,
-          kubernetesConf,
-          kubernetesClient,
-          waitForAppCompletion,
-          appName,
-          watcher,
-          kubernetesResourceNamePrefix)
-        client.run()
+      val client = new Client(
+        builder,
+        kubernetesConf,
+        kubernetesClient,
+        waitForAppCompletion,
+        appName,
+        watcher,
+        kubernetesResourceNamePrefix)
+      client.run()
     }
   }
 }
